@@ -369,7 +369,20 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_entries_gw ON entries(giveaway_id, votes DESC);
+        CREATE TABLE IF NOT EXISTS history_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, giveaway_id INTEGER NOT NULL, entry_id INTEGER,
+            user_id INTEGER NOT NULL, name TEXT NOT NULL, username TEXT, first_name TEXT,
+            votes INTEGER NOT NULL DEFAULT 0, rank INTEGER, is_winner INTEGER NOT NULL DEFAULT 0, created_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_hist_gw ON history_entries(giveaway_id, rank);
         """)
+        # light migrations for databases created by the first V3 version
+        for ddl in ("ALTER TABLE giveaways ADD COLUMN deleted_at TEXT",
+                    "ALTER TABLE giveaways ADD COLUMN final_voters INTEGER NOT NULL DEFAULT 0"):
+            try:
+                con.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 
 
 def now_iso():
@@ -633,6 +646,8 @@ def admin_keyboard():
          btn("Broadcast", "channel", callback_data="abc")],
         [btn("Statistics", "stats", callback_data="astats"),
          btn("Users", "user", callback_data="ausers")],
+        [btn("Giveaway History", "history", style="primary", callback_data="ahist"),
+         btn("Search User", "web", callback_data="ausearch")],
         [btn("Export CSV", "csv", callback_data="acsv"),
          btn("Backup Now", "backup", callback_data="abackup")],
         [btn("Restore Backup", "restore", style="danger", callback_data="arestore")],
@@ -811,6 +826,8 @@ class AdminFlow(StatesGroup):
     update = State()
     support_reply = State()
     restore = State()
+    rename = State()
+    user_search = State()
 
 
 async def admin_only(callback: CallbackQuery):
@@ -1030,6 +1047,18 @@ async def cmd_ban(message: Message):
         return await notice(message.chat.id, f"{E('warn')} {sc('User not found. They must have started the bot.')}")
     run("UPDATE users SET banned=? WHERE user_id=?", (1 if ban else 0, u["user_id"]))
     await notice(message.chat.id, f"{E('ok')} {sc('Banned' if ban else 'Unbanned')} <code>{u['user_id']}</code>", ttl=8)
+
+
+@dp.message(Command("user"))
+async def cmd_user(message: Message, command: CommandObject):
+    """Admin: /user @username | /user 123456 | /user <name>  -> user info card."""
+    if not is_admin(message.from_user.id):
+        return
+    await tidy(message)
+    term = (command.args or "").strip()
+    if not term:
+        return await notice(message.chat.id, "Usage: <code>/user @username</code>, <code>/user 123456</code> or a name", ttl=10)
+    await show_user_results(message.chat.id, term)
 
 
 # ----------------------------------------------------------------------------
@@ -1420,6 +1449,7 @@ def admin_text():
         row("group", "Entries", count("SELECT COUNT(*) FROM entries")),
         row("vote", "Votes", count("SELECT COUNT(*) FROM votes")),
         row("user", "Users", count("SELECT COUNT(*) FROM users")),
+        row("history", "In History", count("SELECT COUNT(*) FROM giveaways WHERE status='deleted'")),
         SEP,
         f"{E('plus')} {sc('Create a giveaway to get a link. Everyone who opens it can register a name.')}",
         f"{E('backup')} {sc('Everything is backed up to the private storage channel.')}",
@@ -1508,7 +1538,7 @@ def admin_gw_kb(g):
              url=share_url(gw_link(g), f"Join the giveaway: {g['name']}")),
          btn("QR Code", "qr", callback_data=f"agq:{gid}")],
         [btn("Leaderboard", "medal", callback_data=f"lbg:{gid}"),
-         btn("Manage Entries", "list", callback_data=f"age:{gid}")],
+         btn("Participants", "list", callback_data=f"age:{gid}")],
         [btn("Close Giveaway" if g["status"] == "open" else "Reopen Giveaway",
              "lock", callback_data=f"agt:{gid}")],
         [btn("Top Voted Winner", "crown", style="success", callback_data=f"agwin:{gid}:top"),
@@ -1640,17 +1670,96 @@ async def gw_announce(callback: CallbackQuery):
     await callback.answer("Announced in the channel.", show_alert=True)
 
 
-async def render_entries(callback, g):
-    rows = q_all("SELECT * FROM entries WHERE giveaway_id=? ORDER BY votes DESC, id ASC LIMIT 15", (g["id"],))
-    lines = [bq(f"{E('list')} {sc('Entries')} ➛ {esc(g['name'])}"), ""]
+ENTRIES_PER_PAGE = 8
+PER_PAGE = 8
+
+
+def like(term):
+    """LIKE pattern that treats % and _ typed by the admin literally."""
+    return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def user_info_lines(uid):
+    """Telegram account info for a user (refreshed every time they use the bot)."""
+    u = get_user(uid)
+    if u:
+        handle = f"@{u['username']}" if u["username"] else sc("No username")
+        lines = [row("user", "Telegram Name", esc(u["first_name"] or "-")),
+                 row("link", "Username", esc(handle)),
+                 row("id", "User ID", f"<code>{uid}</code>"),
+                 row("calendar", "Started Bot", esc((u["joined_at"] or "")[:16])),
+                 row("time", "Last Seen", esc((u["last_seen"] or "")[:16])),
+                 row("ban", "Banned", sc("Yes") if u["banned"] else sc("No"))]
+    else:
+        lines = [row("id", "User ID", f"<code>{uid}</code>"), sc("No profile saved for this user.")]
+    lines.append(f'{E("link")} <a href="tg://user?id={uid}">{sc("Open profile")}</a>')
+    return lines
+
+
+def entry_admin_text(g, e):
+    return "\n".join([
+        bq(f"{E('user')} {sc('Participant')} #{e['id']}"),
+        f"{E('title')} <b>{esc(e['name'])}</b>",
+        "",
+        row("gift", "Giveaway", esc(g["name"])),
+        row("vote", "Votes", e["votes"]),
+        row("rank", "Rank", f"#{rank_of(e)}"),
+        row("calendar", "Registered", esc((e["created_at"] or "")[:16])),
+        SEP,
+        *user_info_lines(e["user_id"]),
+    ])
+
+
+def entry_admin_kb(g, e):
+    u = get_user(e["user_id"])
+    banned = bool(u and u["banned"])
+    rows = [
+        [btn("Rename", "pin", callback_data=f"aer:{e['id']}"),
+         btn("Message User", "mail", style="primary", callback_data=f"sreply:{e['user_id']}")],
+        [btn("Unban User" if banned else "Ban User", "ban", style="success" if banned else "danger",
+             callback_data=f"aub:{e['user_id']}:{e['id']}"),
+         btn("Delete Entry", "trash", style="danger", callback_data=f"aed:{e['id']}")],
+    ]
+    links = []
+    if u and u["username"]:
+        links.append(btn("Open Chat", "user", url=f"https://t.me/{u['username']}"))
+    post = post_link(e["message_id"])
+    if post:
+        links.append(btn("View Post", "channel", url=post))
+    if links:
+        rows.append(links)
+    rows.append([btn("Participants", "list", callback_data=f"age:{g['id']}")])
+    return admin_back(*rows)
+
+
+async def render_entries(callback, g, page=0):
+    total = count("SELECT COUNT(*) FROM entries WHERE giveaway_id=?", (g["id"],))
+    pages = max(1, -(-total // ENTRIES_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = q_all("SELECT e.*, u.username FROM entries e LEFT JOIN users u ON u.user_id=e.user_id "
+                 "WHERE e.giveaway_id=? ORDER BY e.votes DESC, e.id ASC LIMIT ? OFFSET ?",
+                 (g["id"], ENTRIES_PER_PAGE, page * ENTRIES_PER_PAGE))
+    lines = [bq(f"{E('list')} {sc('Participants')} ➛ {esc(g['name'])}"), ""]
     kb = []
     if rows:
-        for i, r in enumerate(rows, 1):
-            lines.append(f"{i}. <b>{esc(r['name'])}</b> (#{r['id']}) ➛ {r['votes']} {sc('votes')}")
-            kb.append([btn(f"#{r['id']} {r['name'][:28]}", "trash", style="danger", callback_data=f"aed:{r['id']}")])
-        lines += [SEP, f"{E('warn')} {sc('Tap an entry to delete it with its votes and channel post.')}"]
+        for i, r in enumerate(rows, page * ENTRIES_PER_PAGE + 1):
+            handle = f"@{r['username']}" if r["username"] else "-"
+            lines.append(f"{i}. <b>{esc(r['name'])}</b> · {esc(handle)} · <code>{r['user_id']}</code> "
+                         f"➛ {r['votes']} {sc('votes')}")
+            label = f"#{r['id']} {r['name'][:22]} {handle if r['username'] else ''}".strip()
+            kb.append([btn(label[:48], "user", callback_data=f"aei:{r['id']}")])
+        lines += [SEP, f"{E('bolt')} {sc('Tap a participant to see their info and manage them.')}"]
+        if pages > 1:
+            lines.append(sc(f"Page {page + 1} of {pages}"))
     else:
         lines.append(sc("No entries yet."))
+    nav = []
+    if page > 0:
+        nav.append(btn("Prev", "reply", callback_data=f"age:{g['id']}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(btn("Next", "bolt", callback_data=f"age:{g['id']}:{page + 1}"))
+    if nav:
+        kb.append(nav)
     kb.append([btn("Back", "gift", callback_data=f"agw:{g['id']}")])
     await safe_edit(callback, "\n".join(lines), admin_back(*kb))
 
@@ -1660,12 +1769,106 @@ async def gw_entries(callback: CallbackQuery):
     g = await _gw_from(callback)
     if not g:
         return
-    await render_entries(callback, g)
+    parts = callback.data.split(":")
+    await render_entries(callback, g, int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0)
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("aei:"))
+async def entry_detail(callback: CallbackQuery):
+    if not await admin_only(callback):
+        return
+    e = get_entry(int(callback.data.split(":")[1]))
+    g = get_giveaway(e["giveaway_id"]) if e else None
+    if not e or not g:
+        return await callback.answer("Entry not found.", show_alert=True)
+    await safe_edit(callback, entry_admin_text(g, e), entry_admin_kb(g, e))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("aer:"))
+async def entry_rename_start(callback: CallbackQuery, state: FSMContext):
+    if not await admin_only(callback):
+        return
+    e = get_entry(int(callback.data.split(":")[1]))
+    if not e:
+        return await callback.answer("Entry not found.", show_alert=True)
+    await state.clear()
+    await state.set_state(AdminFlow.rename)
+    await state.update_data(eid=e["id"])
+    await ask(callback.message.chat.id, f"{E('pin')} {sc('Send the new name for')} <b>{esc(e['name'])}</b> "
+                                        f"{sc('(max 40 characters).')}\n{sc('Send /cancel to stop.')}")
+    await callback.answer()
+
+
+@dp.message(AdminFlow.rename)
+async def entry_rename_do(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    chat = message.chat.id
+    await tidy(message)
+    name = re.sub(r"\s+", " ", message.text or "").strip()
+    if not name or len(name) > 40:
+        return await notice(chat, f"{E('warn')} {sc('Send a valid name (max 40 characters).')}", ttl=6)
+    data = await state.get_data()
+    e = get_entry(data.get("eid"))
+    g = get_giveaway(e["giveaway_id"]) if e else None
+    await state.clear()
+    await sweep(chat)
+    if not e or not g:
+        return await notice(chat, f"{E('err')} {sc('Entry not found.')}", ttl=8)
+    run("UPDATE entries SET name=? WHERE id=?", (name, e["id"]))
+    if e["message_id"]:   # keep the channel post in sync
+        try:
+            await bot.edit_message_text(text=entry_post_text(g, name), chat_id=CHANNEL_ID, message_id=e["message_id"],
+                                        reply_markup=vote_kb(e["id"], e["votes"]))
+        except Exception:
+            logging.exception("could not edit the channel post")
+    mark_dirty()
+    e = get_entry(e["id"])
+    await show_panel(chat, entry_admin_text(g, e), entry_admin_kb(g, e))
+
+
+@dp.callback_query(F.data.startswith("aub:"))
+async def user_ban_toggle(callback: CallbackQuery):
+    if not await admin_only(callback):
+        return
+    _, uid, eid = callback.data.split(":")
+    uid, eid = int(uid), int(eid)
+    u = get_user(uid)
+    if not u:
+        return await callback.answer("User not found.", show_alert=True)
+    if uid in ADMINS:
+        return await callback.answer("You can't ban an admin.", show_alert=True)
+    now_banned = 0 if u["banned"] else 1
+    run("UPDATE users SET banned=? WHERE user_id=?", (now_banned, uid))
+    mark_dirty()
+    await callback.answer("User banned." if now_banned else "User unbanned.")
+    e = get_entry(eid) if eid else None
+    g = get_giveaway(e["giveaway_id"]) if e else None
+    if e and g:
+        await safe_edit(callback, entry_admin_text(g, e), entry_admin_kb(g, e))
+    else:
+        await safe_edit(callback, user_admin_text(uid), user_admin_kb(uid))
+
+
 @dp.callback_query(F.data.startswith("aed:"))
-async def entry_delete(callback: CallbackQuery):
+async def entry_delete_ask(callback: CallbackQuery):
+    if not await admin_only(callback):
+        return
+    e = get_entry(int(callback.data.split(":")[1]))
+    if not e:
+        return await callback.answer("Already deleted.", show_alert=True)
+    await safe_edit(callback, f"{E('warn')} <b>{sc('Delete this entry?')}</b>\n\n<b>{esc(e['name'])}</b>\n"
+                              f"{sc('Its votes and channel post are removed, and its voters can vote again.')}",
+                    InlineKeyboardMarkup(inline_keyboard=[
+                        [btn("Yes, Delete", "trash", style="danger", callback_data=f"aedy:{e['id']}"),
+                         btn("Cancel", "err", callback_data=f"aei:{e['id']}")]]))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("aedy:"))
+async def entry_delete_do(callback: CallbackQuery):
     if not await admin_only(callback):
         return
     e = get_entry(int(callback.data.split(":")[1]))
@@ -1683,17 +1886,35 @@ async def entry_delete(callback: CallbackQuery):
         await render_entries(callback, g)
 
 
+# ---- delete giveaway -> saved in History --------------------------------------------
 @dp.callback_query(F.data.startswith("agdel:"))
 async def gw_delete_ask(callback: CallbackQuery):
     g = await _gw_from(callback)
     if not g:
         return
     await safe_edit(callback, f"{E('warn')} <b>{sc('Delete this giveaway?')}</b>\n\n{esc(g['name'])}\n"
-                              f"{sc('All entries, votes and channel posts are removed. The link stops working.')}",
+                              f"{sc('Entries, votes and channel posts are removed and the link stops working.')}\n"
+                              f"{E('history')} {sc('A full copy (names, usernames, votes, winner) is saved in History.')}",
                     InlineKeyboardMarkup(inline_keyboard=[
                         [btn("Yes, Delete", "trash", style="danger", callback_data=f"agdely:{g['id']}"),
                          btn("Cancel", "err", callback_data=f"agw:{g['id']}")]]))
     await callback.answer()
+
+
+def archive_giveaway(g):
+    """Copy the giveaway's final standings (with Telegram username/name of each participant) into History."""
+    gid = g["id"]
+    entries = q_all("SELECT e.*, u.username, u.first_name FROM entries e LEFT JOIN users u ON u.user_id=e.user_id "
+                    "WHERE e.giveaway_id=? ORDER BY e.votes DESC, e.id ASC", (gid,))
+    voters = count("SELECT COUNT(*) FROM votes WHERE giveaway_id=?", (gid,))
+    with db() as con:
+        con.execute("DELETE FROM history_entries WHERE giveaway_id=?", (gid,))
+        for i, e in enumerate(entries, 1):
+            con.execute("INSERT INTO history_entries(giveaway_id, entry_id, user_id, name, username, first_name, "
+                        "votes, rank, is_winner, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (gid, e["id"], e["user_id"], e["name"], e["username"], e["first_name"], e["votes"], i,
+                         1 if e["id"] == g["winner_entry_id"] else 0, e["created_at"]))
+        con.execute("UPDATE giveaways SET deleted_at=?, final_voters=? WHERE id=?", (now_iso(), voters, gid))
 
 
 @dp.callback_query(F.data.startswith("agdely:"))
@@ -1702,13 +1923,144 @@ async def gw_delete_do(callback: CallbackQuery):
     if not g:
         return
     await callback.answer("Deleting...")
+    archive_giveaway(g)                      # save to History first
     for e in q_all("SELECT message_id FROM entries WHERE giveaway_id=? AND message_id IS NOT NULL", (g["id"],)):
         await _delete(CHANNEL_ID, e["message_id"])
     run("DELETE FROM votes WHERE giveaway_id=?", (g["id"],))
     run("DELETE FROM entries WHERE giveaway_id=?", (g["id"],))
     run("UPDATE giveaways SET status='deleted', winner_entry_id=NULL WHERE id=?", (g["id"],))
     mark_dirty()
-    await safe_edit(callback, f"{E('ok')} {sc('Giveaway deleted.')}", admin_back())
+    await log_channel(f"{E('history')} <b>{sc('Giveaway moved to history')}</b> #{g['id']} ➛ {esc(g['name'])}")
+    await safe_edit(callback, f"{E('ok')} {sc('Giveaway deleted and saved to History.')}",
+                    admin_back([btn("Open In History", "history", style="primary", callback_data=f"ahv:{g['id']}")]))
+
+
+def hist_totals(gid):
+    r = q_one("SELECT COUNT(*), COALESCE(SUM(votes),0) FROM history_entries WHERE giveaway_id=?", (gid,))
+    return r[0], r[1]
+
+
+@dp.callback_query(F.data.startswith("ahist"))
+async def hist_list(callback: CallbackQuery):
+    if not await admin_only(callback):
+        return
+    parts = callback.data.split(":")
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    total = count("SELECT COUNT(*) FROM giveaways WHERE status='deleted'")
+    pages = max(1, -(-total // PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = q_all("SELECT * FROM giveaways WHERE status='deleted' ORDER BY COALESCE(deleted_at, created_at) DESC, id DESC "
+                 "LIMIT ? OFFSET ?", (PER_PAGE, page * PER_PAGE))
+    lines = [bq(f"{E('history')} {sc('Giveaway history')} ({total})"), ""]
+    kb = []
+    if rows:
+        for g in rows:
+            n, v = hist_totals(g["id"])
+            when = (g["deleted_at"] or "")[:10] or "-"
+            lines.append(f"{E('dot')} <b>#{g['id']} {esc(g['name'])}</b> ➛ {n} {sc('entries')} · {v} {sc('votes')} · {when}")
+            kb.append([btn(f"#{g['id']} {g['name'][:34]}", "history", callback_data=f"ahv:{g['id']}")])
+        lines += [SEP, f"{E('bolt')} {sc('Tap a giveaway to see the final standings and participants.')}"]
+    else:
+        lines.append(sc("Nothing here yet. Deleted giveaways are saved in this list."))
+    nav = []
+    if page > 0:
+        nav.append(btn("Prev", "reply", callback_data=f"ahist:{page - 1}"))
+    if page < pages - 1:
+        nav.append(btn("Next", "bolt", callback_data=f"ahist:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    await safe_edit(callback, "\n".join(lines), admin_back(*kb))
+    await callback.answer()
+
+
+def history_text(g):
+    rows = q_all("SELECT * FROM history_entries WHERE giveaway_id=? ORDER BY rank ASC LIMIT 15", (g["id"],))
+    n, v = hist_totals(g["id"])
+    lines = [bq(f"{E('history')} {sc('History')} #{g['id']}"),
+             f"{E('title')} <b>{esc(g['name'])}</b>", "",
+             row("star", "Prize", esc(g["prize"]) if g["prize"] else sc("None")),
+             row("calendar", "Created", esc((g["created_at"] or "")[:16])),
+             row("trash", "Deleted", esc((g["deleted_at"] or "-")[:16])),
+             row("group", "Entries", n),
+             row("vote", "Total Votes", v),
+             row("user", "Voters", g["final_voters"] or 0)]
+    win = q_one("SELECT * FROM history_entries WHERE giveaway_id=? AND is_winner=1", (g["id"],))
+    if win:
+        handle = f" @{win['username']}" if win["username"] else ""
+        lines.append(row("crown", "Winner", f"<b>{esc(win['name'])}</b>{esc(handle)} ({win['votes']} {sc('votes')})"))
+    lines.append(SEP)
+    if not rows:
+        lines.append(sc("No entries were saved for this giveaway."))
+    for r in rows:
+        handle = f"@{r['username']}" if r["username"] else "-"
+        lines.append(f"{MEDALS.get(r['rank'], str(r['rank']) + '.')} <b>{esc(r['name'])}</b> · {esc(handle)} · "
+                     f"<code>{r['user_id']}</code> ➛ {r['votes']} {sc('votes')}")
+    if n > 15:
+        lines.append(sc(f"…and {n - 15} more. Export the CSV for the full list."))
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data.startswith("ahv:"))
+async def hist_view(callback: CallbackQuery):
+    if not await admin_only(callback):
+        return
+    g = q_one("SELECT * FROM giveaways WHERE id=? AND status='deleted'", (int(callback.data.split(":")[1]),))
+    if not g:
+        return await callback.answer("Not found in history.", show_alert=True)
+    await safe_edit(callback, history_text(g), admin_back(
+        [btn("Export CSV", "csv", style="primary", callback_data=f"ahc:{g['id']}"),
+         btn("Erase Forever", "trash", style="danger", callback_data=f"ahx:{g['id']}")],
+        [btn("History", "history", callback_data="ahist")]))
+    await callback.answer()
+
+
+def make_history_csv(gid):
+    rows = q_all("SELECT * FROM history_entries WHERE giveaway_id=? ORDER BY rank", (gid,))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["rank", "name", "votes", "winner", "user_id", "username", "first_name", "registered_at"])
+    for r in rows:
+        w.writerow([r["rank"], _csv_safe(r["name"]), r["votes"], "yes" if r["is_winner"] else "",
+                    r["user_id"], _csv_safe(r["username"]), _csv_safe(r["first_name"]), r["created_at"]])
+    return BufferedInputFile(buf.getvalue().encode("utf-8-sig"), filename=f"history_{gid}.csv")
+
+
+@dp.callback_query(F.data.startswith("ahc:"))
+async def hist_csv(callback: CallbackQuery):
+    if not await admin_only(callback):
+        return
+    gid = int(callback.data.split(":")[1])
+    if not q_one("SELECT 1 FROM giveaways WHERE id=? AND status='deleted'", (gid,)):
+        return await callback.answer("Not found in history.", show_alert=True)
+    await callback.answer()
+    await bot.send_document(callback.message.chat.id, make_history_csv(gid),
+                            caption=f"{E('csv')} {sc('History export')} #{gid}")
+
+
+@dp.callback_query(F.data.startswith("ahx:"))
+async def hist_erase_ask(callback: CallbackQuery):
+    if not await admin_only(callback):
+        return
+    gid = int(callback.data.split(":")[1])
+    await safe_edit(callback, f"{E('warn')} <b>{sc('Erase this history entry forever?')}</b>\n\n"
+                              f"{sc('This cannot be undone (only an old backup can bring it back).')}",
+                    InlineKeyboardMarkup(inline_keyboard=[
+                        [btn("Yes, Erase", "trash", style="danger", callback_data=f"ahxy:{gid}"),
+                         btn("Cancel", "err", callback_data=f"ahv:{gid}")]]))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ahxy:"))
+async def hist_erase_do(callback: CallbackQuery):
+    if not await admin_only(callback):
+        return
+    gid = int(callback.data.split(":")[1])
+    run("DELETE FROM history_entries WHERE giveaway_id=?", (gid,))
+    run("DELETE FROM giveaways WHERE id=? AND status='deleted'", (gid,))
+    mark_dirty()
+    await callback.answer("Erased from history.")
+    await safe_edit(callback, f"{E('ok')} {sc('Erased from history.')}",
+                    admin_back([btn("History", "history", callback_data="ahist")]))
 
 
 # ---- stats / users / csv -----------------------------------------------------------
@@ -1731,19 +2083,127 @@ async def admin_stats(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data == "ausers")
-async def admin_users(callback: CallbackQuery):
+def user_admin_text(uid):
+    entries = q_all("SELECT e.*, g.name AS gname FROM entries e JOIN giveaways g ON g.id=e.giveaway_id "
+                    "WHERE e.user_id=? AND g.status!='deleted' ORDER BY e.id DESC LIMIT 8", (uid,))
+    lines = [bq(f"{E('user')} {sc('User')}"), "", *user_info_lines(uid),
+             row("vote", "Votes Cast", count("SELECT COUNT(*) FROM votes WHERE voter_id=?", (uid,))), SEP]
+    if entries:
+        for r in entries:
+            lines.append(f"{E('dot')} <b>{esc(r['gname'])}</b> ➛ {esc(r['name'])} · "
+                         f"{r['votes']} {sc('votes')} · #{rank_of(r)}")
+    else:
+        lines.append(sc("No entries in active giveaways."))
+    return "\n".join(lines)
+
+
+def user_admin_kb(uid):
+    u = get_user(uid)
+    banned = bool(u and u["banned"])
+    entries = q_all("SELECT e.*, g.name AS gname FROM entries e JOIN giveaways g ON g.id=e.giveaway_id "
+                    "WHERE e.user_id=? AND g.status!='deleted' ORDER BY e.id DESC LIMIT 8", (uid,))
+    rows = [[btn(f"{r['gname'][:18]}: {r['name'][:20]}", "gift", callback_data=f"aei:{r['id']}")] for r in entries]
+    rows.append([btn("Message User", "mail", style="primary", callback_data=f"sreply:{uid}"),
+                 btn("Unban User" if banned else "Ban User", "ban", style="success" if banned else "danger",
+                     callback_data=f"aub:{uid}:0")])
+    if u and u["username"]:
+        rows.append([btn("Open Chat", "user", url=f"https://t.me/{u['username']}")])
+    rows.append([btn("Users", "user", callback_data="ausers")])
+    return admin_back(*rows)
+
+
+def search_users(term):
+    """Find users by @username, numeric id, Telegram name, or the name they entered in a giveaway."""
+    t = term.strip().lstrip("@")
+    uid = int(t) if t.isdigit() else -1
+    pat = like(t.lower())
+    return q_all("SELECT * FROM users WHERE user_id=? OR lower(username)=? OR lower(first_name) LIKE ? ESCAPE '\\' "
+                 "OR user_id IN (SELECT user_id FROM entries WHERE lower(name) LIKE ? ESCAPE '\\') "
+                 "ORDER BY last_seen DESC LIMIT 8", (uid, t.lower(), pat, pat))
+
+
+async def show_user_results(chat_id, term):
+    rows = search_users(term)
+    if not rows:
+        return await notice(chat_id, f"{E('warn')} {sc('No user found. They must have started the bot.')}", ttl=8)
+    if len(rows) == 1:
+        uid = rows[0]["user_id"]
+        return await show_panel(chat_id, user_admin_text(uid), user_admin_kb(uid))
+    lines = [bq(f"{E('user')} {sc('Search results')}"), ""]
+    kb = []
+    for u in rows:
+        handle = f"@{u['username']}" if u["username"] else "-"
+        lines.append(f"{E('dot')} {esc(u['first_name'])} {esc(handle)} <code>{u['user_id']}</code>")
+        kb.append([btn(f"{(u['first_name'] or '')[:20]} {handle if u['username'] else ''}".strip(), "user",
+                       callback_data=f"auv:{u['user_id']}")])
+    await show_panel(chat_id, "\n".join(lines), admin_back(*kb))
+
+
+@dp.callback_query(F.data.startswith("ausers"))
+async def admin_users(callback: CallbackQuery, state: FSMContext):
     if not await admin_only(callback):
         return
-    rows = q_all("SELECT * FROM users ORDER BY joined_at DESC LIMIT 20")
-    lines = [bq(f"{E('user')} {sc('Users')} ({count('SELECT COUNT(*) FROM users')})"), ""]
+    await state.clear()
+    parts = callback.data.split(":")
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    total = count("SELECT COUNT(*) FROM users")
+    pages = max(1, -(-total // PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = q_all("SELECT * FROM users ORDER BY joined_at DESC, user_id DESC LIMIT ? OFFSET ?",
+                 (PER_PAGE, page * PER_PAGE))
+    lines = [bq(f"{E('user')} {sc('Users')} ({total})"), ""]
+    kb = [[btn("Search User", "web", style="primary", callback_data="ausearch")]]
     for u in rows:
         handle = f"@{u['username']}" if u["username"] else "-"
         ban = " 🚫" if u["banned"] else ""
         lines.append(f"{E('dot')} {esc(u['first_name'])} {esc(handle)} <code>{u['user_id']}</code>{ban}")
-    lines += [SEP, sc("Use /ban and /unban with an id or @username.")]
-    await safe_edit(callback, "\n".join(lines), admin_back())
+        kb.append([btn(f"{(u['first_name'] or '')[:20]} {handle if u['username'] else ''}".strip() + (" 🚫" if u["banned"] else ""),
+                       "user", callback_data=f"auv:{u['user_id']}")])
+    lines += [SEP, sc("Tap a user to see their info, entries and manage them.")]
+    nav = []
+    if page > 0:
+        nav.append(btn("Prev", "reply", callback_data=f"ausers:{page - 1}"))
+    if page < pages - 1:
+        nav.append(btn("Next", "bolt", callback_data=f"ausers:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    await safe_edit(callback, "\n".join(lines), admin_back(*kb))
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("auv:"))
+async def admin_user_detail(callback: CallbackQuery):
+    if not await admin_only(callback):
+        return
+    uid = int(callback.data.split(":")[1])
+    if not get_user(uid):
+        return await callback.answer("User not found.", show_alert=True)
+    await safe_edit(callback, user_admin_text(uid), user_admin_kb(uid))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ausearch")
+async def admin_user_search_start(callback: CallbackQuery, state: FSMContext):
+    if not await admin_only(callback):
+        return
+    await state.clear()
+    await state.set_state(AdminFlow.user_search)
+    await ask(callback.message.chat.id, f"{E('web')} {sc('Send an @username, a user ID, a Telegram name, or the name they entered.')}\n"
+                                        f"{sc('Send /cancel to stop.')}")
+    await callback.answer()
+
+
+@dp.message(AdminFlow.user_search)
+async def admin_user_search(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await tidy(message)
+    term = (message.text or "").strip()
+    if not term:
+        return await notice(message.chat.id, f"{E('warn')} {sc('Send some text to search for.')}", ttl=6)
+    await state.clear()
+    await sweep(message.chat.id)
+    await show_user_results(message.chat.id, term)
 
 
 def _csv_safe(v):
